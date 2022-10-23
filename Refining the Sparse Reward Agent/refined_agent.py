@@ -1,13 +1,15 @@
 import random
 import math
 import os
-
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
 import numpy as np
 import pandas as pd
 
 from pysc2.agents import base_agent
-from pysc2.lib import actions
-from pysc2.lib import features
+from pysc2.env import sc2_env
+from pysc2.lib import actions, features, units
+from absl import app
 
 _NO_OP = actions.FUNCTIONS.no_op.id
 _SELECT_POINT = actions.FUNCTIONS.select_point.id
@@ -71,7 +73,7 @@ class QLearningTable:
         
         self.disallowed_actions[observation] = excluded_actions
         
-        state_action = self.q_table.ix[observation, :]
+        state_action = self.q_table.loc[observation, :]
         
         for excluded_action in excluded_actions:
             del state_action[excluded_action]
@@ -93,9 +95,9 @@ class QLearningTable:
         self.check_state_exist(s_)
         self.check_state_exist(s)
         
-        q_predict = self.q_table.ix[s, a]
+        q_predict = self.q_table.loc[s, a]
         
-        s_rewards = self.q_table.ix[s_, :]
+        s_rewards = self.q_table.loc[s_, :]
         
         if s_ in self.disallowed_actions:
             for excluded_action in self.disallowed_actions[s_]:
@@ -107,7 +109,7 @@ class QLearningTable:
             q_target = r  # next state is terminal
             
         # update
-        self.q_table.ix[s, a] += self.lr * (q_target - q_predict)
+        self.q_table.loc[s, a] += self.lr * (q_target - q_predict)
 
     def check_state_exist(self, state):
         if state not in self.q_table.index:
@@ -127,8 +129,16 @@ class SparseAgent(base_agent.BaseAgent):
         self.cc_x = None
         
         self.move_number = 0
+
+        self.total_game = 0
+        self.win_game = 0
+        self.loss_game = 0
+        self.tie_game = 0
+
+        self.step_number = 0
         
         if os.path.isfile(DATA_FILE + '.gz'):
+            print("Reading from saved qtable...")
             self.qlearn.q_table = pd.read_pickle(DATA_FILE + '.gz', compression='gzip')
         
     def transformDistance(self, x, x_distance, y, y_distance):
@@ -160,20 +170,32 @@ class SparseAgent(base_agent.BaseAgent):
             reward = obs.reward
         
             self.qlearn.learn(str(self.previous_state), self.previous_action, reward, 'terminal')
-            
+            print("Saving current qtable...")
             self.qlearn.q_table.to_pickle(DATA_FILE + '.gz', 'gzip')
             
             self.previous_action = None
             self.previous_state = None
             
             self.move_number = 0
+
+            print("Game Over:::::Game Reward: ", reward)
+            if reward == 1:
+                self.win_game += 1
+            elif reward == -1:
+                self.loss_game += 1
+            elif reward == 0:
+                self.tie_game += 1
+
+            self.total_game += 1
+            print(f"======Game winning rate: win: {self.win_game}, loss: {self.loss_game}, tie: {self.tie_game}, pct: {self.win_game * 100/self.total_game}%")
+
             
             return actions.FunctionCall(_NO_OP, [])
         
-        unit_type = obs.observation['screen'][_UNIT_TYPE]
+        unit_type = obs.observation['feature_screen'][_UNIT_TYPE]
 
         if obs.first():
-            player_y, player_x = (obs.observation['minimap'][_PLAYER_RELATIVE] == _PLAYER_SELF).nonzero()
+            player_y, player_x = (obs.observation['feature_minimap'][_PLAYER_RELATIVE] == _PLAYER_SELF).nonzero()
             self.base_top_left = 1 if player_y.any() and player_y.mean() <= 31 else 0
         
             self.cc_y, self.cc_x = (unit_type == _TERRAN_COMMANDCENTER).nonzero()
@@ -193,6 +215,10 @@ class SparseAgent(base_agent.BaseAgent):
         worker_supply = obs.observation['player'][6]
         
         supply_free = supply_limit - supply_used
+
+        self.step_number += 1
+        if self.step_number % 100 == 0:
+            print(f"supply_depot_cout: {supply_depot_count}, barracks_count: {barracks_count}, supply_used: {supply_used}, supply_limit: {supply_limit}, army_supply: {army_supply} ")
         
         if self.move_number == 0:
             self.move_number += 1
@@ -204,7 +230,7 @@ class SparseAgent(base_agent.BaseAgent):
             current_state[3] = obs.observation['player'][_ARMY_SUPPLY]
     
             hot_squares = np.zeros(4)        
-            enemy_y, enemy_x = (obs.observation['minimap'][_PLAYER_RELATIVE] == _PLAYER_HOSTILE).nonzero()
+            enemy_y, enemy_x = (obs.observation['feature_minimap'][_PLAYER_RELATIVE] == _PLAYER_HOSTILE).nonzero()
             for i in range(0, len(enemy_y)):
                 y = int(math.ceil((enemy_y[i] + 1) / 32))
                 x = int(math.ceil((enemy_x[i] + 1) / 32))
@@ -218,7 +244,7 @@ class SparseAgent(base_agent.BaseAgent):
                 current_state[i + 4] = hot_squares[i]
     
             green_squares = np.zeros(4)        
-            friendly_y, friendly_x = (obs.observation['minimap'][_PLAYER_RELATIVE] == _PLAYER_SELF).nonzero()
+            friendly_y, friendly_x = (obs.observation['feature_minimap'][_PLAYER_RELATIVE] == _PLAYER_SELF).nonzero()
             for i in range(0, len(friendly_y)):
                 y = int(math.ceil((friendly_y[i] + 1) / 32))
                 x = int(math.ceil((friendly_x[i] + 1) / 32))
@@ -341,3 +367,37 @@ class SparseAgent(base_agent.BaseAgent):
                         return actions.FunctionCall(_HARVEST_GATHER, [_QUEUED, target])
         
         return actions.FunctionCall(_NO_OP, [])
+
+
+def main(unused_argv):
+  agent = SparseAgent()
+  try:
+    while True:
+      with sc2_env.SC2Env(
+          map_name="AbyssalReef",
+          players=[sc2_env.Agent(sc2_env.Race.terran),
+                   sc2_env.Bot(sc2_env.Race.random,
+                               sc2_env.Difficulty.very_easy)],
+          agent_interface_format=features.AgentInterfaceFormat(
+              feature_dimensions=features.Dimensions(screen=84, minimap=64),
+              use_feature_units=True),
+          step_mul=16,
+          game_steps_per_episode=0,
+          visualize=False) as env:
+          
+        agent.setup(env.observation_spec(), env.action_spec())
+        
+        timesteps = env.reset()
+        agent.reset()
+        
+        while True:
+          step_actions = [agent.step(timesteps[0])]
+          if timesteps[0].last():
+            break
+          timesteps = env.step(step_actions)
+      
+  except KeyboardInterrupt:
+    pass
+  
+if __name__ == "__main__":
+  app.run(main)

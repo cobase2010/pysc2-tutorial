@@ -1,12 +1,15 @@
 import random
 import math
 
+import warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
 import numpy as np
 import pandas as pd
 
 from pysc2.agents import base_agent
-from pysc2.lib import actions
-from pysc2.lib import features
+from pysc2.env import sc2_env
+from pysc2.lib import actions, features, units
+from absl import app
 
 _NO_OP = actions.FUNCTIONS.no_op.id
 _SELECT_POINT = actions.FUNCTIONS.select_point.id
@@ -67,7 +70,7 @@ class QLearningTable:
         
         if np.random.uniform() < self.epsilon:
             # choose best action
-            state_action = self.q_table.ix[observation, :]
+            state_action = self.q_table.loc[observation, :]
             
             # some actions have the same value
             state_action = state_action.reindex(np.random.permutation(state_action.index))
@@ -83,11 +86,11 @@ class QLearningTable:
         self.check_state_exist(s_)
         self.check_state_exist(s)
         
-        q_predict = self.q_table.ix[s, a]
-        q_target = r + self.gamma * self.q_table.ix[s_, :].max()
+        q_predict = self.q_table.loc[s, a]
+        q_target = r + self.gamma * self.q_table.loc[s_, :].max()
         
         # update
-        self.q_table.ix[s, a] += self.lr * (q_target - q_predict)
+        self.q_table.loc[s, a] += self.lr * (q_target - q_predict)
 
     def check_state_exist(self, state):
         if state not in self.q_table.index:
@@ -105,20 +108,37 @@ class SmartAgent(base_agent.BaseAgent):
         
         self.previous_action = None
         self.previous_state = None
-        
+        self.total_game = 0
+        self.win_game = 0
+        self.loss_game = 0
+        self.tie_game = 0
+
     def transformLocation(self, x, x_distance, y, y_distance):
         if not self.base_top_left:
             return [x - x_distance, y - y_distance]
         
         return [x + x_distance, y + y_distance]
-        
+ 
     def step(self, obs):
+
         super(SmartAgent, self).step(obs)
-        
-        player_y, player_x = (obs.observation['minimap'][_PLAYER_RELATIVE] == _PLAYER_SELF).nonzero()
+        if obs.last():
+            reward = obs.reward
+            print("Game Over:::::Game Reward: ", reward)
+            if reward == 1:
+                self.win_game += 1
+            elif reward == -1:
+                self.loss_game += 1
+            elif reward == 0:
+                self.tie_game += 1
+
+            self.total_game += 1
+            print(f"======Game winning rate: win: {self.win_game}, loss: {self.loss_game}, tie: {self.tie_game}, pct: {self.win_game * 100/self.total_game}%")
+
+        player_y, player_x = (obs.observation.feature_minimap.player_relative == features.PlayerRelative.SELF).nonzero()
         self.base_top_left = 1 if player_y.any() and player_y.mean() <= 31 else 0
         
-        unit_type = obs.observation['screen'][_UNIT_TYPE]
+        unit_type = obs.observation['feature_screen'][_UNIT_TYPE]
 
         depot_y, depot_x = (unit_type == _TERRAN_SUPPLY_DEPOT).nonzero()
         supply_depot_count = supply_depot_count = 1 if depot_y.any() else 0
@@ -162,7 +182,7 @@ class SmartAgent(base_agent.BaseAgent):
             return actions.FunctionCall(_NO_OP, [])
 
         elif smart_action == ACTION_SELECT_SCV:
-            unit_type = obs.observation['screen'][_UNIT_TYPE]
+            unit_type = obs.observation['feature_screen'][_UNIT_TYPE]
             unit_y, unit_x = (unit_type == _TERRAN_SCV).nonzero()
                 
             if unit_y.any():
@@ -173,7 +193,7 @@ class SmartAgent(base_agent.BaseAgent):
         
         elif smart_action == ACTION_BUILD_SUPPLY_DEPOT:
             if _BUILD_SUPPLY_DEPOT in obs.observation['available_actions']:
-                unit_type = obs.observation['screen'][_UNIT_TYPE]
+                unit_type = obs.observation['feature_screen'][_UNIT_TYPE]
                 unit_y, unit_x = (unit_type == _TERRAN_COMMANDCENTER).nonzero()
                 
                 if unit_y.any():
@@ -183,7 +203,7 @@ class SmartAgent(base_agent.BaseAgent):
         
         elif smart_action == ACTION_BUILD_BARRACKS:
             if _BUILD_BARRACKS in obs.observation['available_actions']:
-                unit_type = obs.observation['screen'][_UNIT_TYPE]
+                unit_type = obs.observation['feature_screen'][_UNIT_TYPE]
                 unit_y, unit_x = (unit_type == _TERRAN_COMMANDCENTER).nonzero()
                 
                 if unit_y.any():
@@ -192,7 +212,7 @@ class SmartAgent(base_agent.BaseAgent):
                     return actions.FunctionCall(_BUILD_BARRACKS, [_NOT_QUEUED, target])
     
         elif smart_action == ACTION_SELECT_BARRACKS:
-            unit_type = obs.observation['screen'][_UNIT_TYPE]
+            unit_type = obs.observation['feature_screen'][_UNIT_TYPE]
             unit_y, unit_x = (unit_type == _TERRAN_BARRACKS).nonzero()
                 
             if unit_y.any():
@@ -216,3 +236,37 @@ class SmartAgent(base_agent.BaseAgent):
                 return actions.FunctionCall(_ATTACK_MINIMAP, [_NOT_QUEUED, [21, 24]])
         
         return actions.FunctionCall(_NO_OP, [])
+
+
+def main(unused_argv):
+  agent = SmartAgent()
+  try:
+    while True:
+      with sc2_env.SC2Env(
+          map_name="AbyssalReef",
+          players=[sc2_env.Agent(sc2_env.Race.terran),
+                   sc2_env.Bot(sc2_env.Race.random,
+                               sc2_env.Difficulty.very_easy)],
+          agent_interface_format=features.AgentInterfaceFormat(
+              feature_dimensions=features.Dimensions(screen=84, minimap=64),
+              use_feature_units=True),
+          step_mul=16,
+          game_steps_per_episode=0,
+          visualize=False) as env:
+          
+        agent.setup(env.observation_spec(), env.action_spec())
+        
+        timesteps = env.reset()
+        agent.reset()
+        
+        while True:
+          step_actions = [agent.step(timesteps[0])]
+          if timesteps[0].last():
+            break
+          timesteps = env.step(step_actions)
+      
+  except KeyboardInterrupt:
+    pass
+  
+if __name__ == "__main__":
+  app.run(main)
